@@ -1,0 +1,820 @@
+#!/usr/bin/env bash
+#
+# cue-normalize - normalize and repair problematic CUE files in music archives
+#
+# Copyright (c) 2026 Sergey
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly VERSION="1.0.0"
+readonly ARCHIVE_ROOT="$(pwd -P)"
+readonly BACKUP_ROOT="${ARCHIVE_ROOT}/Original_CUE"
+
+DRY_RUN=0
+VERBOSE=0
+
+TOTAL_FILES=0
+PROCESSED_FILES=0
+SKIPPED_VALID=0
+SKIPPED_UNSAFE=0
+UPDATED_FILES=0
+BACKUP_CREATED=0
+
+TMP_FILES=()
+UNSAFE_REPORT=()
+
+usage() {
+  cat <<EOF
+Usage: ${SCRIPT_NAME} [--dry-run] [--verbose] [--help] [--version]
+
+Normalize and repair .cue files recursively from the current directory.
+
+Options:
+  -n, --dry-run   Show what would change without modifying files
+  -v, --verbose   Print extra diagnostics
+  -h, --help      Show this help
+      --version   Show version
+EOF
+}
+
+log() {
+  printf '%s\n' "$*"
+}
+
+verbose() {
+  if [[ "${VERBOSE}" -eq 1 ]]; then
+    printf '%s\n' "$*"
+  fi
+}
+
+warn() {
+  printf 'WARNING: %s\n' "$*" >&2
+}
+
+record_unsafe() {
+  local rel_path="$1"
+  local reason="$2"
+  UNSAFE_REPORT+=("${rel_path} :: ${reason}")
+}
+
+register_tmp() {
+  TMP_FILES+=("$1")
+}
+
+cleanup_all_tmps() {
+  local tmp
+  for tmp in "${TMP_FILES[@]:-}"; do
+    [[ -n "${tmp}" ]] && rm -f -- "${tmp}" 2>/dev/null || true
+  done
+}
+
+trap cleanup_all_tmps EXIT
+
+cleanup_tmps() {
+  local tmp
+  for tmp in "$@"; do
+    rm -f -- "${tmp}" 2>/dev/null || true
+  done
+}
+
+add_fix_note() {
+  local fixes_file="$1"
+  local message="$2"
+
+  if ! grep -Fxq -- "${message}" "${fixes_file}" 2>/dev/null; then
+    printf '%s\n' "${message}" >> "${fixes_file}"
+  fi
+}
+
+detect_encoding() {
+  local file_path="$1"
+  local detected=""
+
+  if command -v uchardet >/dev/null 2>&1; then
+    detected="$(uchardet "$file_path" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "${detected}" || "${detected}" == "unknown" ]]; then
+    detected="$(
+      file -bi "$file_path" 2>/dev/null \
+      | sed -n 's/.*charset=//p' \
+      | head -n 1
+    )"
+  fi
+
+  detected="$(printf '%s' "${detected}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+
+  case "${detected}" in
+    ""|"unknown"|"binary")
+      return 1
+      ;;
+    utf-8|utf8|us-ascii|ascii)
+      printf 'UTF-8\n'
+      ;;
+    windows-1251|cp1251)
+      printf 'CP1251\n'
+      ;;
+    windows-1252|cp1252)
+      printf 'CP1252\n'
+      ;;
+    iso-8859-1)
+      printf 'ISO-8859-1\n'
+      ;;
+    iso-8859-2)
+      printf 'ISO-8859-2\n'
+      ;;
+    koi8-r)
+      printf 'KOI8-R\n'
+      ;;
+    utf-16le)
+      printf 'UTF-16LE\n'
+      ;;
+    utf-16be)
+      printf 'UTF-16BE\n'
+      ;;
+    *)
+      printf '%s\n' "${detected}"
+      ;;
+  esac
+}
+
+convert_to_utf8() {
+  local src="$1"
+  local dst="$2"
+  local encoding="$3"
+
+  if [[ "${encoding}" == "UTF-8" ]]; then
+    cp -- "${src}" "${dst}"
+    return 0
+  fi
+
+  iconv -f "${encoding}" -t UTF-8 -- "${src}" > "${dst}"
+}
+
+normalize_name_for_match() {
+  local value="$1"
+  printf '%s' "${value}" \
+    | tr '[:upper:]' '[:lower:]' \
+    | LC_ALL=C tr -cd 'a-z0-9'
+}
+
+type_matches_file() {
+  local cue_type="$1"
+  local file_name="$2"
+  local ext="${file_name##*.}"
+
+  ext="$(printf '%s' "${ext}" | tr '[:upper:]' '[:lower:]')"
+  cue_type="$(printf '%s' "${cue_type}" | tr '[:lower:]' '[:upper:]')"
+
+  case "${cue_type}" in
+    MP3)
+      [[ "${ext}" == "mp3" ]]
+      ;;
+    WAVE)
+      [[ "${ext}" == "wav" || "${ext}" == "wave" ]]
+      ;;
+    AIFF)
+      [[ "${ext}" == "aif" || "${ext}" == "aiff" ]]
+      ;;
+    *)
+      [[ "${ext}" =~ ^(ape|flac|mp3|wav|wave|wv|m4a|aac|ogg|opus|tta|tak|aif|aiff|alac)$ ]]
+      ;;
+  esac
+}
+
+rewrite_file_reference() {
+  local cue_file="$1"
+  local new_ref="$2"
+  local tmp_rewrite
+
+  tmp_rewrite="$(mktemp)"
+  register_tmp "${tmp_rewrite}"
+  NEW_FILE_REF="${new_ref}" perl -0pe 's{^(\s*FILE)\s+"[^"]+"\s+([A-Za-z0-9_-]+).*$}{$1 "$ENV{NEW_FILE_REF}" $2}mi' "${cue_file}" > "${tmp_rewrite}"
+  mv -- "${tmp_rewrite}" "${cue_file}"
+}
+
+repair_file_reference_with_fs() {
+  local cue_file="$1"
+  local source_dir="$2"
+  local fixes_file="$3"
+  local file_ref=""
+  local file_type=""
+  local ref_without_ext=""
+  local normalized_ref=""
+  local found_count=0
+  local found_match=""
+  local candidate=""
+  local candidate_name=""
+  local candidate_stem=""
+  local normalized_candidate=""
+
+  mapfile -t parsed_file_line < <(
+    perl -ne '
+      if (/^\s*FILE\s+"([^"]+)"\s+([A-Za-z0-9_-]+)/i) {
+        print "$1\n$2\n";
+        exit 0;
+      }
+    ' "${cue_file}"
+  )
+
+  if [[ "${#parsed_file_line[@]}" -lt 2 ]]; then
+    return 0
+  fi
+
+  file_ref="${parsed_file_line[0]}"
+  file_type="${parsed_file_line[1]}"
+
+  if [[ -e "${source_dir}/${file_ref}" ]]; then
+    return 0
+  fi
+
+  ref_without_ext="${file_ref%.*}"
+  if [[ "${ref_without_ext}" == "${file_ref}" ]]; then
+    while IFS= read -r -d '' candidate; do
+      candidate_name="$(basename "${candidate}")"
+      candidate_stem="${candidate_name%.*}"
+      if type_matches_file "${file_type}" "${candidate_name}" && [[ "${candidate_stem}" == "${file_ref}" ]]; then
+        found_count=$((found_count + 1))
+        found_match="${candidate_name}"
+      fi
+    done < <(find "${source_dir}" -maxdepth 1 -type f -print0)
+
+    if [[ "${found_count}" -eq 1 ]]; then
+      rewrite_file_reference "${cue_file}" "${found_match}"
+      add_fix_note "${fixes_file}" "resolved FILE extension from adjacent audio file"
+      return 0
+    fi
+  fi
+
+  normalized_ref="$(normalize_name_for_match "${file_ref}")"
+  found_count=0
+  found_match=""
+
+  while IFS= read -r -d '' candidate; do
+    candidate_name="$(basename "${candidate}")"
+    if ! type_matches_file "${file_type}" "${candidate_name}"; then
+      continue
+    fi
+    normalized_candidate="$(normalize_name_for_match "${candidate_name}")"
+    if [[ -n "${normalized_ref}" && "${normalized_candidate}" == "${normalized_ref}" ]]; then
+      found_count=$((found_count + 1))
+      found_match="${candidate_name}"
+    fi
+  done < <(find "${source_dir}" -maxdepth 1 -type f -print0)
+
+  if [[ "${found_count}" -eq 1 ]]; then
+    rewrite_file_reference "${cue_file}" "${found_match}"
+    add_fix_note "${fixes_file}" "resolved FILE name from adjacent audio file"
+    return 0
+  fi
+
+  normalized_ref="$(normalize_name_for_match "${ref_without_ext}")"
+  found_count=0
+  found_match=""
+
+  while IFS= read -r -d '' candidate; do
+    candidate_name="$(basename "${candidate}")"
+    candidate_stem="${candidate_name%.*}"
+    if ! type_matches_file "${file_type}" "${candidate_name}"; then
+      continue
+    fi
+    normalized_candidate="$(normalize_name_for_match "${candidate_stem}")"
+    if [[ -n "${normalized_ref}" && "${normalized_candidate}" == "${normalized_ref}" ]]; then
+      found_count=$((found_count + 1))
+      found_match="${candidate_name}"
+    fi
+  done < <(find "${source_dir}" -maxdepth 1 -type f -print0)
+
+  if [[ "${found_count}" -eq 1 ]]; then
+    rewrite_file_reference "${cue_file}" "${found_match}"
+    add_fix_note "${fixes_file}" "resolved FILE name from adjacent audio file"
+    return 0
+  fi
+
+  found_count=0
+  found_match=""
+  while IFS= read -r -d '' candidate; do
+    candidate_name="$(basename "${candidate}")"
+    if type_matches_file "${file_type}" "${candidate_name}"; then
+      found_count=$((found_count + 1))
+      found_match="${candidate_name}"
+    fi
+  done < <(find "${source_dir}" -maxdepth 1 -type f -print0)
+
+  if [[ "${found_count}" -eq 1 ]]; then
+    rewrite_file_reference "${cue_file}" "${found_match}"
+    add_fix_note "${fixes_file}" "resolved FILE name from sole adjacent audio file"
+  fi
+}
+
+normalize_cue_file() {
+  local input_file="$1"
+  local output_file="$2"
+  local fixes_file="$3"
+  local source_dir="$4"
+
+  perl - "$input_file" "$output_file" "$fixes_file" "$source_dir" <<'PERL'
+use strict;
+use warnings;
+
+my ($input, $output, $fixes_path, $source_dir) = @ARGV;
+
+open my $in, '<:encoding(UTF-8)', $input or die "Cannot read $input: $!";
+local $/;
+my $text = <$in>;
+close $in;
+
+my %fixes;
+
+sub list_audio_candidates {
+  my ($dir) = @_;
+  opendir my $dh, $dir or die "Cannot open $dir: $!";
+  my @files = grep {
+    -f "$dir/$_" && /\.(?:ape|flac|mp3|wav|wv|m4a|aac|ogg|opus|tta|tak|aif|aiff|alac)$/i
+  } readdir $dh;
+  closedir $dh;
+  return @files;
+}
+
+sub canonical_name {
+  my ($value) = @_;
+  $value = lc $value;
+  $value =~ s/\.[^.]+$//;
+  $value =~ s/[^a-z0-9]+//g;
+  return $value;
+}
+
+sub expected_extensions_for_type {
+  my ($type) = @_;
+  my $upper = uc $type;
+  return qw(mp3) if $upper eq 'MP3';
+  return qw(wav wave) if $upper eq 'WAVE';
+  return qw(aif aiff) if $upper eq 'AIFF';
+  return qw(mp3 flac ape wav wave wv m4a aac ogg opus tta tak aif aiff alac);
+}
+
+sub extension_matches_type {
+  my ($filename, $type) = @_;
+  my ($ext) = $filename =~ /\.([^.]+)$/;
+  return 0 if !defined $ext;
+  my %allowed = map { $_ => 1 } expected_extensions_for_type($type);
+  return $allowed{lc $ext} ? 1 : 0;
+}
+
+sub resolve_file_reference {
+  my ($name, $type, $candidates_ref) = @_;
+  my @candidates = @{$candidates_ref};
+  my $exact_path = "$source_dir/$name";
+  return ($name, undef) if -e $exact_path;
+
+  my @typed_candidates = grep { extension_matches_type($_, $type) } @candidates;
+  @typed_candidates = @candidates if !@typed_candidates;
+
+  my $name_has_ext = $name =~ /\.[^.]+$/ ? 1 : 0;
+  my $canon = canonical_name($name);
+
+  if (!$name_has_ext) {
+    my @suffix_matches = grep {
+      my $candidate = $_;
+      $candidate =~ /^\Q$name\E\.[^.]+$/i;
+    } @typed_candidates;
+    return ($suffix_matches[0], 'resolved FILE extension from adjacent audio file')
+      if @suffix_matches == 1;
+  }
+
+  my @full_matches = grep { canonical_name($_) eq $canon } @typed_candidates;
+  return ($full_matches[0], 'resolved FILE name from adjacent audio file')
+    if @full_matches == 1;
+
+  my $base = $name;
+  $base =~ s/\.[^.]+$//;
+  my $base_canon = canonical_name($base);
+  my @base_matches = grep {
+    my $candidate = $_;
+    $candidate =~ s/\.[^.]+$//;
+    canonical_name($candidate) eq $base_canon;
+  } @typed_candidates;
+  return ($base_matches[0], 'resolved FILE name from adjacent audio file')
+    if @base_matches == 1;
+
+  if (@typed_candidates == 1) {
+    return ($typed_candidates[0], 'resolved FILE name from sole adjacent audio file');
+  }
+
+  return ($name, undef);
+}
+
+my @audio_candidates = list_audio_candidates($source_dir);
+
+if ($text =~ s/^\x{FEFF}//) {
+  $fixes{'removed UTF-8 BOM'} = 1;
+}
+
+my $unicode_cleanup = 0;
+$unicode_cleanup += ($text =~ s/[\x{2018}\x{2019}\x{201A}\x{201B}\x{2032}\x{2035}]/'/g);
+$unicode_cleanup += ($text =~ s/[\x{201C}\x{201D}\x{201E}\x{201F}\x{2033}\x{2036}]/"/g);
+$unicode_cleanup += ($text =~ s/[\x{00A0}\x{2000}-\x{200B}\x{202F}\x{205F}\x{3000}]/ /g);
+if ($unicode_cleanup) {
+  $fixes{'normalized Unicode quotes and spaces'} = 1;
+}
+
+my $line_ending_changes = 0;
+$line_ending_changes += ($text =~ s/\r\n/\n/g);
+$line_ending_changes += ($text =~ s/\r/\n/g);
+if ($line_ending_changes) {
+  $fixes{'converted CRLF/CR to LF'} = 1;
+}
+
+my $control_cleanup = 0;
+$control_cleanup += ($text =~ s/\x00//g);
+$control_cleanup += ($text =~ s/\x1A+\z//);
+$control_cleanup += ($text =~ s/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]//g);
+if ($control_cleanup) {
+  $fixes{'removed control characters'} = 1;
+}
+
+my @lines = split /\n/, $text, -1;
+my $expected_track = 1;
+for my $line (@lines) {
+  if ($line =~ /^(\s*TRACK)\s*(\d{1,3})\s+(.*?)\s*$/i) {
+    my ($keyword, $track_no, $track_type) = ($1, $2, $3);
+    my $normalized_track = sprintf('%02d', $expected_track);
+    my $normalized_type = uc $track_type;
+    $normalized_type =~ s/^\s+//;
+    $normalized_type =~ s/\s+$//;
+    $normalized_type =~ s/\s+/ /g;
+    if ($track_no ne $normalized_track || $normalized_type ne 'AUDIO') {
+      $line = sprintf('%s %s AUDIO', $keyword, $normalized_track);
+      $fixes{'normalized TRACK entries'} = 1;
+    } elsif ($line ne sprintf('%s %s AUDIO', $keyword, $normalized_track)) {
+      $line = sprintf('%s %s AUDIO', $keyword, $normalized_track);
+      $fixes{'normalized TRACK entries'} = 1;
+    }
+    $expected_track++;
+    next;
+  }
+
+  if ($line =~ /^(\s*(?:INDEX|PREGAP|POSTGAP))\s+(.+?)\s*$/i) {
+    my ($keyword, $rest) = ($1, $2);
+    my $upper_keyword = uc $keyword;
+
+    if ($upper_keyword =~ /INDEX$/ && $rest =~ /^(\d{1,2})\s+(\d{1,3}):(\d{1,2}):(\d{1,2})$/) {
+      my ($index_no, $mm, $ss, $ff) = ($1, $2, $3, $4);
+      my $normalized_line = sprintf('%s %02d %02d:%02d:%02d', $keyword, $index_no, $mm, $ss, $ff);
+      if ($normalized_line ne $line) {
+        $line = $normalized_line;
+        $fixes{'normalized INDEX entries'} = 1;
+      }
+      next;
+    }
+
+    if (($upper_keyword =~ /PREGAP$/ || $upper_keyword =~ /POSTGAP$/) && $rest =~ /^(\d{1,3}):(\d{1,2}):(\d{1,2})$/) {
+      my ($mm, $ss, $ff) = ($1, $2, $3);
+      my $normalized_line = sprintf('%s %02d:%02d:%02d', $keyword, $mm, $ss, $ff);
+      if ($normalized_line ne $line) {
+        $line = $normalized_line;
+        $fixes{'normalized INDEX entries'} = 1;
+      }
+      next;
+    }
+  }
+
+  if ($line =~ /^(\s*PERFORMER)\s+(.+?)\s*$/i) {
+    my ($keyword, $value) = ($1, $2);
+    if ($value !~ /^"(.*)"$/) {
+      $value =~ s/^\s+//;
+      $value =~ s/\s+$//;
+      my $stray_trimmed = 0;
+      $stray_trimmed += ($value =~ s/^"+//);
+      $stray_trimmed += ($value =~ s/"+$//);
+      if ($stray_trimmed) {
+        $fixes{'fixed broken quote pairs'} = 1;
+      }
+      $line = sprintf('%s "%s"', $keyword, $value);
+      $fixes{'quoted PERFORMER values'} = 1;
+    } else {
+      my $inner = $1;
+      my $trimmed = $inner;
+      if ($trimmed =~ s/\s+$//) {
+        $line = sprintf('%s "%s"', $keyword, $trimmed);
+        $fixes{'trimmed trailing spaces inside quotes'} = 1;
+      }
+    }
+    next;
+  }
+
+  if ($line =~ /^(\s*(?:TITLE|SONGWRITER))\s+(.+?)\s*$/i) {
+    my ($keyword, $value) = ($1, $2);
+    if ($value =~ /^"(.*)"$/) {
+      my $trimmed = $1;
+      if ($trimmed =~ s/\s+$//) {
+        $line = sprintf('%s "%s"', $keyword, $trimmed);
+        $fixes{'trimmed trailing spaces inside quotes'} = 1;
+      }
+    } else {
+      $value =~ s/^\s+//;
+      $value =~ s/\s+$//;
+      my $stray_trimmed = 0;
+      $stray_trimmed += ($value =~ s/^"+//);
+      $stray_trimmed += ($value =~ s/"+$//);
+      if ($stray_trimmed) {
+        $fixes{'fixed broken quote pairs'} = 1;
+      }
+      $line = sprintf('%s "%s"', $keyword, $value);
+      $fixes{'quoted TITLE/SONGWRITER values'} = 1;
+    }
+    next;
+  }
+
+  if ($line =~ /^(\s*FILE)\s+(.+?)\s*$/i) {
+    my ($keyword, $rest) = ($1, $2);
+    my ($name, $type, $comment) = ('', '', '');
+
+    if ($rest =~ /^"(.*)"\s+([A-Za-z0-9_-]+)(\s*;.*)?$/) {
+      ($name, $type, $comment) = ($1, $2, $3 // '');
+    } elsif ($rest =~ /^(.*?)\s+([A-Za-z0-9_-]+)(\s*;.*)?$/) {
+      ($name, $type, $comment) = ($1, $2, $3 // '');
+      $fixes{'quoted FILE paths'} = 1;
+    } else {
+      next;
+    }
+
+    $name =~ s/^\s+//;
+    if ($name =~ s/\s+$//) {
+      $fixes{'trimmed trailing spaces inside quotes'} = 1;
+    }
+
+    my $normalized_type = uc $type;
+    if ($normalized_type ne $type) {
+      $fixes{'normalized FILE entries'} = 1;
+    }
+
+    my ($resolved_name, $resolve_fix) = resolve_file_reference($name, $normalized_type, \@audio_candidates);
+    if (defined $resolve_fix && $resolved_name ne $name) {
+      $name = $resolved_name;
+      $fixes{$resolve_fix} = 1;
+    }
+
+    if ($comment ne '') {
+      $fixes{'removed FILE trailing comments'} = 1;
+    }
+
+    my $normalized_line = sprintf('%s "%s" %s', $keyword, $name, $normalized_type);
+    if ($normalized_line ne $line) {
+      $fixes{'normalized FILE entries'} = 1;
+      $line = $normalized_line;
+    }
+    next;
+  }
+
+}
+
+my $normalized = join("\n", @lines);
+
+open my $out, '>:encoding(UTF-8)', $output or die "Cannot write $output: $!";
+print {$out} $normalized;
+close $out;
+
+open my $fixes_fh, '>:encoding(UTF-8)', $fixes_path or die "Cannot write $fixes_path: $!";
+for my $fix (sort keys %fixes) {
+  print {$fixes_fh} $fix, "\n";
+}
+close $fixes_fh;
+PERL
+}
+
+validate_cue_file() {
+  local file_path="$1"
+  local source_dir="$2"
+  local file_ref=""
+
+  if [[ ! -s "${file_path}" ]]; then
+    verbose "Validation failed: empty file"
+    return 1
+  fi
+
+  if ! grep -qiE '^[[:space:]]*FILE[[:space:]]+".+"[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*$' "${file_path}"; then
+    verbose "Validation failed: missing valid FILE entry"
+    return 1
+  fi
+
+  if ! grep -qiE '^[[:space:]]*TRACK[[:space:]]+[0-9]{2,3}[[:space:]]+AUDIO[[:space:]]*$' "${file_path}"; then
+    verbose "Validation failed: missing TRACK AUDIO entry"
+    return 1
+  fi
+
+  if ! grep -qiE '^[[:space:]]*INDEX[[:space:]]+01[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]*$' "${file_path}"; then
+    verbose "Validation failed: missing INDEX 01 entry"
+    return 1
+  fi
+
+  if ! perl -ne '
+    my $line = $_;
+    $line =~ s/\\"//g;
+    my $quotes = ($line =~ tr/"/"/);
+    if ($quotes % 2 != 0) {
+      exit 1;
+    }
+  ' "${file_path}"; then
+    verbose "Validation failed: uneven quotes on at least one line"
+    return 1
+  fi
+
+  file_ref="$(sed -n 's/^[[:space:]]*FILE[[:space:]]*"\([^"]*\)"[[:space:]].*/\1/p' "${file_path}" | head -n 1)"
+  if [[ -z "${file_ref}" ]]; then
+    verbose "Validation failed: could not parse FILE reference"
+    return 1
+  fi
+
+  if [[ ! -e "${source_dir}/${file_ref}" ]]; then
+    verbose "Validation failed: referenced audio file does not exist"
+    return 1
+  fi
+
+  return 0
+}
+
+ensure_backup() {
+  local src="$1"
+  local rel_path="$2"
+  local backup_path="${BACKUP_ROOT}/${rel_path}"
+  local backup_dir
+
+  backup_dir="$(dirname "${backup_path}")"
+  mkdir -p -- "${backup_dir}"
+
+  if [[ -e "${backup_path}" ]]; then
+    verbose "Backup already exists: ${backup_path}"
+    return 0
+  fi
+
+  cp -p -- "${src}" "${backup_path}"
+  BACKUP_CREATED=$((BACKUP_CREATED + 1))
+}
+
+print_fix_list() {
+  local fixes_file="$1"
+  if [[ ! -s "${fixes_file}" ]]; then
+    printf 'none'
+    return 0
+  fi
+
+  awk 'BEGIN { first = 1 } { if (!first) printf ", "; printf "%s", $0; first = 0 }' "${fixes_file}"
+}
+
+process_file() {
+  local rel_input="$1"
+  local rel_path="${rel_input#./}"
+  local abs_path="${ARCHIVE_ROOT}/${rel_path}"
+  local source_dir
+  local tmp_utf8
+  local tmp_normalized
+  local tmp_fixes
+  local encoding
+  local fixes_text
+
+  PROCESSED_FILES=$((PROCESSED_FILES + 1))
+  log "[${PROCESSED_FILES}/${TOTAL_FILES}] Processing: ${rel_path}"
+  source_dir="$(dirname "${abs_path}")"
+
+  tmp_utf8="$(mktemp)"
+  tmp_normalized="$(mktemp)"
+  tmp_fixes="$(mktemp)"
+  register_tmp "${tmp_utf8}"
+  register_tmp "${tmp_normalized}"
+  register_tmp "${tmp_fixes}"
+
+  if ! encoding="$(detect_encoding "${abs_path}")"; then
+    warn "Skipping unsafe file (unknown encoding): ${rel_path}"
+    SKIPPED_UNSAFE=$((SKIPPED_UNSAFE + 1))
+    record_unsafe "${rel_path}" "unknown encoding"
+    cleanup_tmps "${tmp_utf8}" "${tmp_normalized}" "${tmp_fixes}"
+    return 0
+  fi
+  verbose "Detected encoding: ${encoding}"
+
+  if ! convert_to_utf8 "${abs_path}" "${tmp_utf8}" "${encoding}"; then
+    warn "Skipping unsafe file (iconv failed): ${rel_path}"
+    SKIPPED_UNSAFE=$((SKIPPED_UNSAFE + 1))
+    record_unsafe "${rel_path}" "iconv failed"
+    cleanup_tmps "${tmp_utf8}" "${tmp_normalized}" "${tmp_fixes}"
+    return 0
+  fi
+
+  if ! normalize_cue_file "${tmp_utf8}" "${tmp_normalized}" "${tmp_fixes}" "${source_dir}"; then
+    warn "Skipping unsafe file (normalization failed): ${rel_path}"
+    SKIPPED_UNSAFE=$((SKIPPED_UNSAFE + 1))
+    record_unsafe "${rel_path}" "normalization failed"
+    cleanup_tmps "${tmp_utf8}" "${tmp_normalized}" "${tmp_fixes}"
+    return 0
+  fi
+
+  repair_file_reference_with_fs "${tmp_normalized}" "${source_dir}" "${tmp_fixes}"
+
+  if ! validate_cue_file "${tmp_normalized}" "${source_dir}"; then
+    warn "Skipping unsafe file (validation failed after normalization): ${rel_path}"
+    SKIPPED_UNSAFE=$((SKIPPED_UNSAFE + 1))
+    record_unsafe "${rel_path}" "validation failed after normalization"
+    cleanup_tmps "${tmp_utf8}" "${tmp_normalized}" "${tmp_fixes}"
+    return 0
+  fi
+
+  if cmp -s -- "${abs_path}" "${tmp_normalized}"; then
+    log "  fixes: none (already valid)"
+    SKIPPED_VALID=$((SKIPPED_VALID + 1))
+    cleanup_tmps "${tmp_utf8}" "${tmp_normalized}" "${tmp_fixes}"
+    return 0
+  fi
+
+  fixes_text="$(print_fix_list "${tmp_fixes}")"
+  log "  fixes: ${fixes_text}"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "  action: dry-run only, no files changed"
+    cleanup_tmps "${tmp_utf8}" "${tmp_normalized}" "${tmp_fixes}"
+    return 0
+  fi
+
+  if ! ensure_backup "${abs_path}" "${rel_path}"; then
+    warn "Skipping unsafe file (backup failed): ${rel_path}"
+    SKIPPED_UNSAFE=$((SKIPPED_UNSAFE + 1))
+    record_unsafe "${rel_path}" "backup failed"
+    cleanup_tmps "${tmp_utf8}" "${tmp_normalized}" "${tmp_fixes}"
+    return 0
+  fi
+
+  chmod --reference="${abs_path}" "${tmp_normalized}"
+  touch -r "${abs_path}" "${tmp_normalized}"
+  mv -- "${tmp_normalized}" "${abs_path}"
+  UPDATED_FILES=$((UPDATED_FILES + 1))
+  log "  action: updated"
+
+  cleanup_tmps "${tmp_utf8}" "${tmp_normalized}" "${tmp_fixes}"
+}
+
+while (($# > 0)); do
+  case "$1" in
+    -n|--dry-run)
+      DRY_RUN=1
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --version)
+      printf '%s %s\n' "${SCRIPT_NAME}" "${VERSION}"
+      exit 0
+      ;;
+    *)
+      printf 'Unknown option: %s\n\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+mkdir -p -- "${BACKUP_ROOT}"
+
+TOTAL_FILES="$(
+  find . -path "./Original_CUE" -prune -o -type f \( -iname '*.cue' \) -print0 \
+  | awk 'BEGIN { RS = "\0"; count = 0 } { count++ } END { print count }'
+)"
+
+log "Archive root: ${ARCHIVE_ROOT}"
+log "Backup root: ${BACKUP_ROOT}"
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  log "Mode: dry-run"
+fi
+
+if [[ "${TOTAL_FILES}" -eq 0 ]]; then
+  log "No .cue files found."
+  exit 0
+fi
+
+while IFS= read -r -d '' cue_file; do
+  process_file "${cue_file}"
+done < <(find . -path "./Original_CUE" -prune -o -type f \( -iname '*.cue' \) -print0)
+
+log ""
+log "Summary:"
+log "  total found: ${TOTAL_FILES}"
+log "  processed: ${PROCESSED_FILES}"
+log "  updated: ${UPDATED_FILES}"
+log "  skipped already valid: ${SKIPPED_VALID}"
+log "  skipped unsafe: ${SKIPPED_UNSAFE}"
+log "  backups created: ${BACKUP_CREATED}"
+
+if [[ "${#UNSAFE_REPORT[@]}" -gt 0 ]]; then
+  log ""
+  log "Unsafe files:"
+  for entry in "${UNSAFE_REPORT[@]}"; do
+    log "  ${entry}"
+  done
+fi
