@@ -1,3 +1,4 @@
+# Maintainer: Serhii Kovalyov <seryogakovalyov at gmail dot com>
 pkgname=cue-normalize
 pkgver=1.0.0
 pkgrel=1
