@@ -4,12 +4,13 @@ Minimal Bash CLI for normalizing and repairing problematic `.cue` files in large
 
 ## Features
 
-- Recursively scans `.cue` files from the current directory
+- Recursively scans `.cue` files from a selected archive root
 - Converts legacy encodings to UTF-8
 - Removes UTF-8 BOM and CRLF line endings
 - Repairs common broken `TITLE`, `PERFORMER`, `SONGWRITER`, `FILE`, and `TRACK` lines
 - Tries to resolve broken `FILE` references from adjacent audio files
 - Creates centralized backups in `Original_CUE/`
+- Does not create backup directories in `--dry-run` mode
 - Uses temporary files and only replaces originals after validation
 - Supports `--dry-run` and `--verbose`
 
@@ -20,6 +21,13 @@ Run from the root of a music archive:
 ```bash
 cue-normalize --dry-run --verbose
 cue-normalize
+```
+
+Or pass an archive root explicitly:
+
+```bash
+cue-normalize --dry-run --verbose /path/to/music/archive
+cue-normalize /path/to/music/archive
 ```
 
 Show help:

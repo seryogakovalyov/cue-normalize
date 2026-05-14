@@ -8,10 +8,12 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly VERSION="1.0.0"
-readonly ARCHIVE_ROOT="$(pwd -P)"
-readonly BACKUP_ROOT="${ARCHIVE_ROOT}/Original_CUE"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+readonly VERSION="1.0.1"
+ARCHIVE_ROOT=""
+BACKUP_ROOT=""
+ARCHIVE_ARG=""
 
 DRY_RUN=0
 VERBOSE=0
@@ -29,8 +31,10 @@ UNSAFE_REPORT=()
 usage() {
   cat <<EOF
 Usage: ${SCRIPT_NAME} [--dry-run] [--verbose] [--help] [--version]
+       ${SCRIPT_NAME} [options] [archive-root]
 
-Normalize and repair .cue files recursively from the current directory.
+Normalize and repair .cue files recursively from the selected archive root.
+If archive-root is omitted, the current directory is used.
 
 Options:
   -n, --dry-run   Show what would change without modifying files
@@ -80,18 +84,14 @@ cleanup_tmps() {
   done
 }
 
-add_fix_note() {
-  local fixes_file="$1"
-  local message="$2"
-
-  if ! grep -Fxq -- "${message}" "${fixes_file}" 2>/dev/null; then
-    printf '%s\n' "${message}" >> "${fixes_file}"
-  fi
-}
-
 detect_encoding() {
   local file_path="$1"
   local detected=""
+
+  if iconv -f UTF-8 -t UTF-8 -- "${file_path}" >/dev/null 2>&1; then
+    printf 'UTF-8\n'
+    return 0
+  fi
 
   if command -v uchardet >/dev/null 2>&1; then
     detected="$(uchardet "$file_path" 2>/dev/null || true)"
@@ -114,11 +114,20 @@ detect_encoding() {
     utf-8|utf8|us-ascii|ascii)
       printf 'UTF-8\n'
       ;;
-    windows-1251|cp1251)
+    windows-1251|cp1251|ms-cyrillic)
       printf 'CP1251\n'
       ;;
     windows-1252|cp1252)
       printf 'CP1252\n'
+      ;;
+    windows-1250|cp1250)
+      printf 'CP1250\n'
+      ;;
+    cp866|ibm866|866)
+      printf 'CP866\n'
+      ;;
+    macintosh|mac|macroman)
+      printf 'MACINTOSH\n'
       ;;
     iso-8859-1)
       printf 'ISO-8859-1\n'
@@ -126,8 +135,32 @@ detect_encoding() {
     iso-8859-2)
       printf 'ISO-8859-2\n'
       ;;
+    iso-8859-5)
+      printf 'ISO-8859-5\n'
+      ;;
+    iso-8859-7)
+      printf 'ISO-8859-7\n'
+      ;;
+    iso-8859-15)
+      printf 'ISO-8859-15\n'
+      ;;
     koi8-r)
       printf 'KOI8-R\n'
+      ;;
+    koi8-u)
+      printf 'KOI8-U\n'
+      ;;
+    shift_jis|shift-jis|sjis|windows-31j|cp932)
+      printf 'CP932\n'
+      ;;
+    gbk|cp936|gb2312)
+      printf 'GBK\n'
+      ;;
+    gb18030)
+      printf 'GB18030\n'
+      ;;
+    big5|big-5|cp950)
+      printf 'BIG5\n'
       ;;
     utf-16le)
       printf 'UTF-16LE\n'
@@ -154,162 +187,6 @@ convert_to_utf8() {
   iconv -f "${encoding}" -t UTF-8 -- "${src}" > "${dst}"
 }
 
-normalize_name_for_match() {
-  local value="$1"
-  printf '%s' "${value}" \
-    | tr '[:upper:]' '[:lower:]' \
-    | LC_ALL=C tr -cd 'a-z0-9'
-}
-
-type_matches_file() {
-  local cue_type="$1"
-  local file_name="$2"
-  local ext="${file_name##*.}"
-
-  ext="$(printf '%s' "${ext}" | tr '[:upper:]' '[:lower:]')"
-  cue_type="$(printf '%s' "${cue_type}" | tr '[:lower:]' '[:upper:]')"
-
-  case "${cue_type}" in
-    MP3)
-      [[ "${ext}" == "mp3" ]]
-      ;;
-    WAVE)
-      [[ "${ext}" == "wav" || "${ext}" == "wave" ]]
-      ;;
-    AIFF)
-      [[ "${ext}" == "aif" || "${ext}" == "aiff" ]]
-      ;;
-    *)
-      [[ "${ext}" =~ ^(ape|flac|mp3|wav|wave|wv|m4a|aac|ogg|opus|tta|tak|aif|aiff|alac)$ ]]
-      ;;
-  esac
-}
-
-rewrite_file_reference() {
-  local cue_file="$1"
-  local new_ref="$2"
-  local tmp_rewrite
-
-  tmp_rewrite="$(mktemp)"
-  register_tmp "${tmp_rewrite}"
-  NEW_FILE_REF="${new_ref}" perl -0pe 's{^(\s*FILE)\s+"[^"]+"\s+([A-Za-z0-9_-]+).*$}{$1 "$ENV{NEW_FILE_REF}" $2}mi' "${cue_file}" > "${tmp_rewrite}"
-  mv -- "${tmp_rewrite}" "${cue_file}"
-}
-
-repair_file_reference_with_fs() {
-  local cue_file="$1"
-  local source_dir="$2"
-  local fixes_file="$3"
-  local file_ref=""
-  local file_type=""
-  local ref_without_ext=""
-  local normalized_ref=""
-  local found_count=0
-  local found_match=""
-  local candidate=""
-  local candidate_name=""
-  local candidate_stem=""
-  local normalized_candidate=""
-
-  mapfile -t parsed_file_line < <(
-    perl -ne '
-      if (/^\s*FILE\s+"([^"]+)"\s+([A-Za-z0-9_-]+)/i) {
-        print "$1\n$2\n";
-        exit 0;
-      }
-    ' "${cue_file}"
-  )
-
-  if [[ "${#parsed_file_line[@]}" -lt 2 ]]; then
-    return 0
-  fi
-
-  file_ref="${parsed_file_line[0]}"
-  file_type="${parsed_file_line[1]}"
-
-  if [[ -e "${source_dir}/${file_ref}" ]]; then
-    return 0
-  fi
-
-  ref_without_ext="${file_ref%.*}"
-  if [[ "${ref_without_ext}" == "${file_ref}" ]]; then
-    while IFS= read -r -d '' candidate; do
-      candidate_name="$(basename "${candidate}")"
-      candidate_stem="${candidate_name%.*}"
-      if type_matches_file "${file_type}" "${candidate_name}" && [[ "${candidate_stem}" == "${file_ref}" ]]; then
-        found_count=$((found_count + 1))
-        found_match="${candidate_name}"
-      fi
-    done < <(find "${source_dir}" -maxdepth 1 -type f -print0)
-
-    if [[ "${found_count}" -eq 1 ]]; then
-      rewrite_file_reference "${cue_file}" "${found_match}"
-      add_fix_note "${fixes_file}" "resolved FILE extension from adjacent audio file"
-      return 0
-    fi
-  fi
-
-  normalized_ref="$(normalize_name_for_match "${file_ref}")"
-  found_count=0
-  found_match=""
-
-  while IFS= read -r -d '' candidate; do
-    candidate_name="$(basename "${candidate}")"
-    if ! type_matches_file "${file_type}" "${candidate_name}"; then
-      continue
-    fi
-    normalized_candidate="$(normalize_name_for_match "${candidate_name}")"
-    if [[ -n "${normalized_ref}" && "${normalized_candidate}" == "${normalized_ref}" ]]; then
-      found_count=$((found_count + 1))
-      found_match="${candidate_name}"
-    fi
-  done < <(find "${source_dir}" -maxdepth 1 -type f -print0)
-
-  if [[ "${found_count}" -eq 1 ]]; then
-    rewrite_file_reference "${cue_file}" "${found_match}"
-    add_fix_note "${fixes_file}" "resolved FILE name from adjacent audio file"
-    return 0
-  fi
-
-  normalized_ref="$(normalize_name_for_match "${ref_without_ext}")"
-  found_count=0
-  found_match=""
-
-  while IFS= read -r -d '' candidate; do
-    candidate_name="$(basename "${candidate}")"
-    candidate_stem="${candidate_name%.*}"
-    if ! type_matches_file "${file_type}" "${candidate_name}"; then
-      continue
-    fi
-    normalized_candidate="$(normalize_name_for_match "${candidate_stem}")"
-    if [[ -n "${normalized_ref}" && "${normalized_candidate}" == "${normalized_ref}" ]]; then
-      found_count=$((found_count + 1))
-      found_match="${candidate_name}"
-    fi
-  done < <(find "${source_dir}" -maxdepth 1 -type f -print0)
-
-  if [[ "${found_count}" -eq 1 ]]; then
-    rewrite_file_reference "${cue_file}" "${found_match}"
-    add_fix_note "${fixes_file}" "resolved FILE name from adjacent audio file"
-    return 0
-  fi
-
-  found_count=0
-  found_match=""
-  while IFS= read -r -d '' candidate; do
-    candidate_name="$(basename "${candidate}")"
-    if type_matches_file "${file_type}" "${candidate_name}"; then
-      found_count=$((found_count + 1))
-      found_match="${candidate_name}"
-    fi
-  done < <(find "${source_dir}" -maxdepth 1 -type f -print0)
-
-  if [[ "${found_count}" -eq 1 ]]; then
-    rewrite_file_reference "${cue_file}" "${found_match}"
-    add_fix_note "${fixes_file}" "resolved FILE name from sole adjacent audio file"
-  fi
-}
-
 normalize_cue_file() {
   local input_file="$1"
   local output_file="$2"
@@ -319,6 +196,7 @@ normalize_cue_file() {
   perl - "$input_file" "$output_file" "$fixes_file" "$source_dir" <<'PERL'
 use strict;
 use warnings;
+use Encode qw(FB_CROAK decode encode);
 
 my ($input, $output, $fixes_path, $source_dir) = @ARGV;
 
@@ -332,11 +210,20 @@ my %fixes;
 sub list_audio_candidates {
   my ($dir) = @_;
   opendir my $dh, $dir or die "Cannot open $dir: $!";
-  my @files = grep {
-    -f "$dir/$_" && /\.(?:ape|flac|mp3|wav|wv|m4a|aac|ogg|opus|tta|tak|aif|aiff|alac)$/i
-  } readdir $dh;
+  my @files;
+  for my $entry (readdir $dh) {
+    next if !-f "$dir/$entry";
+    next if $entry !~ /\.(?:ape|flac|mp3|wav|wv|m4a|aac|ogg|opus|tta|tak|aif|aiff|alac)$/i;
+    my $decoded = eval { decode('UTF-8', $entry, FB_CROAK) };
+    push @files, defined $decoded ? $decoded : $entry;
+  }
   closedir $dh;
   return @files;
+}
+
+sub cue_name_exists {
+  my ($dir, $name) = @_;
+  return -e "$dir/" . encode('UTF-8', $name);
 }
 
 sub canonical_name {
@@ -364,11 +251,20 @@ sub extension_matches_type {
   return $allowed{lc $ext} ? 1 : 0;
 }
 
+sub normalize_msf {
+  my ($mm, $ss, $ff) = @_;
+  my $total_frames = (($mm * 60) + $ss) * 75 + $ff;
+  my $normalized_mm = int($total_frames / (60 * 75));
+  my $remaining = $total_frames % (60 * 75);
+  my $normalized_ss = int($remaining / 75);
+  my $normalized_ff = $remaining % 75;
+  return ($normalized_mm, $normalized_ss, $normalized_ff);
+}
+
 sub resolve_file_reference {
-  my ($name, $type, $candidates_ref) = @_;
+  my ($name, $type, $candidates_ref, $allow_sole_candidate) = @_;
   my @candidates = @{$candidates_ref};
-  my $exact_path = "$source_dir/$name";
-  return ($name, undef) if -e $exact_path;
+  return ($name, undef) if cue_name_exists($source_dir, $name);
 
   my @typed_candidates = grep { extension_matches_type($_, $type) } @candidates;
   @typed_candidates = @candidates if !@typed_candidates;
@@ -400,7 +296,7 @@ sub resolve_file_reference {
   return ($base_matches[0], 'resolved FILE name from adjacent audio file')
     if @base_matches == 1;
 
-  if (@typed_candidates == 1) {
+  if ($allow_sole_candidate && @typed_candidates == 1) {
     return ($typed_candidates[0], 'resolved FILE name from sole adjacent audio file');
   }
 
@@ -408,17 +304,17 @@ sub resolve_file_reference {
 }
 
 my @audio_candidates = list_audio_candidates($source_dir);
+my $file_line_count = () = $text =~ /^\s*FILE\s+/gmi;
 
 if ($text =~ s/^\x{FEFF}//) {
   $fixes{'removed UTF-8 BOM'} = 1;
 }
 
 my $unicode_cleanup = 0;
-$unicode_cleanup += ($text =~ s/[\x{2018}\x{2019}\x{201A}\x{201B}\x{2032}\x{2035}]/'/g);
 $unicode_cleanup += ($text =~ s/[\x{201C}\x{201D}\x{201E}\x{201F}\x{2033}\x{2036}]/"/g);
 $unicode_cleanup += ($text =~ s/[\x{00A0}\x{2000}-\x{200B}\x{202F}\x{205F}\x{3000}]/ /g);
 if ($unicode_cleanup) {
-  $fixes{'normalized Unicode quotes and spaces'} = 1;
+  $fixes{'normalized Unicode double quotes and spaces'} = 1;
 }
 
 my $line_ending_changes = 0;
@@ -461,22 +357,28 @@ for my $line (@lines) {
     my ($keyword, $rest) = ($1, $2);
     my $upper_keyword = uc $keyword;
 
-    if ($upper_keyword =~ /INDEX$/ && $rest =~ /^(\d{1,2})\s+(\d{1,3}):(\d{1,2}):(\d{1,2})$/) {
+    if ($upper_keyword =~ /INDEX$/ && $rest =~ /^(\d{1,2})\s+(\d+):(\d+):(\d+)$/) {
       my ($index_no, $mm, $ss, $ff) = ($1, $2, $3, $4);
+      my $had_overflow = $ss > 59 || $ff > 74;
+      ($mm, $ss, $ff) = normalize_msf($mm, $ss, $ff) if $had_overflow;
       my $normalized_line = sprintf('%s %02d %02d:%02d:%02d', $keyword, $index_no, $mm, $ss, $ff);
       if ($normalized_line ne $line) {
         $line = $normalized_line;
         $fixes{'normalized INDEX entries'} = 1;
+        $fixes{'normalized INDEX time overflows'} = 1 if $had_overflow;
       }
       next;
     }
 
-    if (($upper_keyword =~ /PREGAP$/ || $upper_keyword =~ /POSTGAP$/) && $rest =~ /^(\d{1,3}):(\d{1,2}):(\d{1,2})$/) {
+    if (($upper_keyword =~ /PREGAP$/ || $upper_keyword =~ /POSTGAP$/) && $rest =~ /^(\d+):(\d+):(\d+)$/) {
       my ($mm, $ss, $ff) = ($1, $2, $3);
+      my $had_overflow = $ss > 59 || $ff > 74;
+      ($mm, $ss, $ff) = normalize_msf($mm, $ss, $ff) if $had_overflow;
       my $normalized_line = sprintf('%s %02d:%02d:%02d', $keyword, $mm, $ss, $ff);
       if ($normalized_line ne $line) {
         $line = $normalized_line;
         $fixes{'normalized INDEX entries'} = 1;
+        $fixes{'normalized INDEX time overflows'} = 1 if $had_overflow;
       }
       next;
     }
@@ -552,7 +454,12 @@ for my $line (@lines) {
       $fixes{'normalized FILE entries'} = 1;
     }
 
-    my ($resolved_name, $resolve_fix) = resolve_file_reference($name, $normalized_type, \@audio_candidates);
+    my ($resolved_name, $resolve_fix) = resolve_file_reference(
+      $name,
+      $normalized_type,
+      \@audio_candidates,
+      $file_line_count == 1
+    );
     if (defined $resolve_fix && $resolved_name ne $name) {
       $name = $resolved_name;
       $fixes{$resolve_fix} = 1;
@@ -589,7 +496,6 @@ PERL
 validate_cue_file() {
   local file_path="$1"
   local source_dir="$2"
-  local file_ref=""
 
   if [[ ! -s "${file_path}" ]]; then
     verbose "Validation failed: empty file"
@@ -606,8 +512,44 @@ validate_cue_file() {
     return 1
   fi
 
-  if ! grep -qiE '^[[:space:]]*INDEX[[:space:]]+01[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]*$' "${file_path}"; then
+  if ! grep -qiE '^[[:space:]]*INDEX[[:space:]]+01[[:space:]]+[0-9]{2,}:[0-9]{2}:[0-9]{2}[[:space:]]*$' "${file_path}"; then
     verbose "Validation failed: missing INDEX 01 entry"
+    return 1
+  fi
+
+  if ! perl -MEncode=encode -MFile::Spec - "$file_path" "$source_dir" <<'PERL'
+use strict;
+use warnings;
+use File::Spec;
+
+my ($file_path, $source_dir) = @ARGV;
+open my $fh, '<:encoding(UTF-8)', $file_path or exit 1;
+
+my $file_count = 0;
+while (my $line = <$fh>) {
+  if ($line =~ /^\s*FILE\s+"([^"]+)"\s+[A-Za-z0-9_-]+\s*$/i) {
+    ++$file_count;
+    my $ref = $1;
+    exit 1 if $ref eq '';
+    exit 1 if !-e File::Spec->catfile($source_dir, encode('UTF-8', $ref));
+    next;
+  }
+
+  if ($line =~ /^\s*INDEX\s+\d{2}\s+(\d{2,}):(\d{2}):(\d{2})\s*$/i) {
+    exit 1 if $2 > 59 || $3 > 74;
+    next;
+  }
+
+  if ($line =~ /^\s*(?:PREGAP|POSTGAP)\s+(\d{2,}):(\d{2}):(\d{2})\s*$/i) {
+    exit 1 if $2 > 59 || $3 > 74;
+    next;
+  }
+}
+
+exit($file_count > 0 ? 0 : 1);
+PERL
+  then
+    verbose "Validation failed: missing audio file reference or invalid INDEX/PREGAP/POSTGAP time"
     return 1
   fi
 
@@ -620,17 +562,6 @@ validate_cue_file() {
     }
   ' "${file_path}"; then
     verbose "Validation failed: uneven quotes on at least one line"
-    return 1
-  fi
-
-  file_ref="$(sed -n 's/^[[:space:]]*FILE[[:space:]]*"\([^"]*\)"[[:space:]].*/\1/p' "${file_path}" | head -n 1)"
-  if [[ -z "${file_ref}" ]]; then
-    verbose "Validation failed: could not parse FILE reference"
-    return 1
-  fi
-
-  if [[ ! -e "${source_dir}/${file_ref}" ]]; then
-    verbose "Validation failed: referenced audio file does not exist"
     return 1
   fi
 
@@ -712,8 +643,6 @@ process_file() {
     return 0
   fi
 
-  repair_file_reference_with_fs "${tmp_normalized}" "${source_dir}" "${tmp_fixes}"
-
   if ! validate_cue_file "${tmp_normalized}" "${source_dir}"; then
     warn "Skipping unsafe file (validation failed after normalization): ${rel_path}"
     SKIPPED_UNSAFE=$((SKIPPED_UNSAFE + 1))
@@ -771,16 +700,56 @@ while (($# > 0)); do
       printf '%s %s\n' "${SCRIPT_NAME}" "${VERSION}"
       exit 0
       ;;
-    *)
+    --)
+      shift
+      break
+      ;;
+    -*)
       printf 'Unknown option: %s\n\n' "$1" >&2
       usage >&2
       exit 2
+      ;;
+    *)
+      if [[ -n "${ARCHIVE_ARG}" ]]; then
+        printf 'Only one archive root may be provided.\n\n' >&2
+        usage >&2
+        exit 2
+      fi
+      ARCHIVE_ARG="$1"
       ;;
   esac
   shift
 done
 
-mkdir -p -- "${BACKUP_ROOT}"
+while (($# > 0)); do
+  if [[ -n "${ARCHIVE_ARG}" ]]; then
+    printf 'Only one archive root may be provided.\n\n' >&2
+    usage >&2
+    exit 2
+  fi
+  ARCHIVE_ARG="$1"
+  shift
+done
+
+if [[ -n "${ARCHIVE_ARG}" ]]; then
+  if [[ ! -d "${ARCHIVE_ARG}" ]]; then
+    printf 'Archive root is not a directory: %s\n' "${ARCHIVE_ARG}" >&2
+    exit 2
+  fi
+  ARCHIVE_ROOT="$(cd "${ARCHIVE_ARG}" && pwd -P)"
+else
+  ARCHIVE_ROOT="$(pwd -P)"
+fi
+readonly ARCHIVE_ROOT
+
+BACKUP_ROOT="${ARCHIVE_ROOT}/Original_CUE"
+readonly BACKUP_ROOT
+
+cd "${ARCHIVE_ROOT}"
+
+if [[ "${DRY_RUN}" -eq 0 ]]; then
+  mkdir -p -- "${BACKUP_ROOT}"
+fi
 
 TOTAL_FILES="$(
   find . -path "./Original_CUE" -prune -o -type f \( -iname '*.cue' \) -print0 \
