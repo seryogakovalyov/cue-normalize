@@ -10,7 +10,7 @@ IFS=$'\n\t'
 
 SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
-readonly VERSION="1.0.1"
+readonly VERSION="1.1.0"
 ARCHIVE_ROOT=""
 BACKUP_ROOT=""
 ARCHIVE_ARG=""
@@ -342,12 +342,18 @@ for my $line (@lines) {
     $normalized_type =~ s/^\s+//;
     $normalized_type =~ s/\s+$//;
     $normalized_type =~ s/\s+/ /g;
-    if ($track_no ne $normalized_track || $normalized_type ne 'AUDIO') {
+    my @known_types = qw(AUDIO CDG VIDEO DATA WAVE MP3 APE FLAC OGG OPUS AAC M4A AIFF WAV);
+    if (grep { $_ eq $normalized_type } @known_types) {
+      # known type — only normalize track number and line format
+      my $want = sprintf('%s %s %s', $keyword, $normalized_track, $normalized_type);
+      if ($line ne $want) {
+        $line = $want;
+        $fixes{'normalized TRACK entries'} = 1;
+      }
+    } else {
+      # unknown/non-standard type — force AUDIO for compatibility with libcue-based players
       $line = sprintf('%s %s AUDIO', $keyword, $normalized_track);
-      $fixes{'normalized TRACK entries'} = 1;
-    } elsif ($line ne sprintf('%s %s AUDIO', $keyword, $normalized_track)) {
-      $line = sprintf('%s %s AUDIO', $keyword, $normalized_track);
-      $fixes{'normalized TRACK entries'} = 1;
+      $fixes{'forced non-standard TRACK type to AUDIO'} = 1;
     }
     $expected_track++;
     next;
@@ -747,14 +753,10 @@ readonly BACKUP_ROOT
 
 cd "${ARCHIVE_ROOT}"
 
-if [[ "${DRY_RUN}" -eq 0 ]]; then
-  mkdir -p -- "${BACKUP_ROOT}"
-fi
 
-TOTAL_FILES="$(
-  find . -path "./Original_CUE" -prune -o -type f \( -iname '*.cue' \) -print0 \
-  | awk 'BEGIN { RS = "\0"; count = 0 } { count++ } END { print count }'
-)"
+CUE_FILES=()
+mapfile -t -d '' CUE_FILES < <(find . -path "./Original_CUE" -prune -o -type f \( -iname '*.cue' \) -print0)
+TOTAL_FILES="${#CUE_FILES[@]}"
 
 log "Archive root: ${ARCHIVE_ROOT}"
 log "Backup root: ${BACKUP_ROOT}"
@@ -767,9 +769,9 @@ if [[ "${TOTAL_FILES}" -eq 0 ]]; then
   exit 0
 fi
 
-while IFS= read -r -d '' cue_file; do
+for cue_file in "${CUE_FILES[@]}"; do
   process_file "${cue_file}"
-done < <(find . -path "./Original_CUE" -prune -o -type f \( -iname '*.cue' \) -print0)
+done
 
 log ""
 log "Summary:"

@@ -1,6 +1,6 @@
 # Maintainer: Serhii Kovalyov <seryogakovalyov at gmail dot com>
 pkgname=cue-normalize
-pkgver=1.0.1
+pkgver=1.1.0
 pkgrel=1
 pkgdesc='Minimal Bash CLI to normalize and repair problematic CUE files'
 arch=('any')
